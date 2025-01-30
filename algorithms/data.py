@@ -68,7 +68,7 @@ def load_and_preprocess(cfg: Config):
 
     for traj in trajs:
         traj['observations'] = (np.array(traj['observations'], dtype=np.float32) - obs_mean) / obs_std
-        traj['rewards'] = (np.array(traj['rewards'], dtype=np.float32) - rewards_mean) / rewards_std
+        traj['rewards'] = ((np.array(traj['rewards'], dtype=np.float32) - rewards_mean) / rewards_std).astype(np.float32)
         traj['actions'] = np.array(traj['actions'], dtype=np.float32)
 
     return trajs, infos
