@@ -1,0 +1,14 @@
+defaults:
+  - algo_base
+
+rollout_length: 5
+epochs: 2
+
+hidden_dim: 256
+latent_dim: 128
+batch_size: 256
+gamma: 0.99
+env: maze2d-umaze-v1
+seed: 0
+target_ema: 0.005
+grad_clip_norm: 10.0

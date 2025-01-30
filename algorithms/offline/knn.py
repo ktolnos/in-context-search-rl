@@ -114,23 +114,6 @@ def wandb_init(config: dict) -> None:
     wandb.run.save()
 
 
-def wrap_env(
-    env: gym.Env,
-    state_mean: Union[np.ndarray, float] = 0.0,
-    state_std: Union[np.ndarray, float] = 1.0,
-    reward_scale: float = 1.0,
-) -> gym.Env:
-    def normalize_state(state):
-        return (state - state_mean) / state_std
-
-    def scale_reward(reward):
-        return reward_scale * reward
-
-    env = gym.wrappers.TransformObservation(env, normalize_state)
-    if reward_scale != 1.0:
-        env = gym.wrappers.TransformReward(env, scale_reward)
-    return env
-
 
 def discounted_cumsum(x: np.ndarray, gamma: float) -> np.ndarray:
     cumsum = np.zeros_like(x)

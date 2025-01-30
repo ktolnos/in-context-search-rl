@@ -1,0 +1,9 @@
+defaults:
+  - submitit_local
+timeout_min: 5750
+#submitit_folder: /h/eop/submitit
+cpus_per_task: 20
+gpus_per_node: 1
+tasks_per_node: 1
+mem_gb: 16
+nodes: 1
