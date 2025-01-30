@@ -11,6 +11,6 @@ cpus_per_task: 16
 exclude: gpu138,gpu148
 setup:
   - "source ~/.bashrc"
-  - "module load cuda-11.8; export MUJOCO_PY_BYPASS_LOCK=True; export LD_LIBRARY_PATH=/pkgs/cudnn-8.8/lib:$LD_LIBRARY_PATH; export LD_LIBRARY_PATH=/pkgs/cuda-11.8/extras/CUPTI/lib64/:$LD_LIBRARY_PATH; export MUJOCO_GL=egl; cd /h/eop/in-context-search-rl; source venv/bin/activate; export DISPLAY=0; export PYTHONPATH=/h/eop/in-context-search-rl:$PYTHONPATH"
+  - "module load cuda-11.8; export MUJOCO_PY_BYPASS_LOCK=True; export LD_LIBRARY_PATH=/h/eop/.mujoco/mujoco210/bin:/pkgs/cudnn-8.8/lib:$LD_LIBRARY_PATH; export LD_LIBRARY_PATH=/pkgs/cuda-11.8/extras/CUPTI/lib64/:$LD_LIBRARY_PATH; export MUJOCO_GL=egl; cd /h/eop/in-context-search-rl; source venv/bin/activate; export DISPLAY=0; export PYTHONPATH=/h/eop/in-context-search-rl:$PYTHONPATH"
   - "hostname"
   - "nvidia-smi"

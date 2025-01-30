@@ -3,11 +3,10 @@ git+https://github.com/tinkoff-ai/d4rl@master#egg=d4rl
 tqdm==4.64.0
 wandb==0.12.21
 mujoco-py==2.1.2.14
-numpy==1.23.1
 gym[mujoco_py,classic_control]==0.23.0
 --extra-index-url https://download.pytorch.org/whl/cu113
-#torch==1.11.0+cu113
-pyrallis==0.3.1
+ torch==2.5.1
+ pyrallis==0.3.1
 --find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 jax==0.4.1
 jaxlib[cuda11_cudnn82]==0.4.1
@@ -17,3 +16,7 @@ distrax==0.1.2
 chex==0.1.5
 hydra-core==1.3.2
 hydra-submitit-launcher==1.2.0
+cython<3
+pynndescent==0.5.13
+numpy==1.23.1
+numba==0.60.0
