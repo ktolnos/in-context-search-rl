@@ -16,4 +16,4 @@ datasets_in_use = set([
     "relocate-cloned-v1",
 ])
 
-groups_to_plot = ["5step-2epoch"]
+groups_to_plot = ["5step-2epoch", "5epochs"]

@@ -115,150 +115,162 @@ def run_knn(cfg: Config):
             'reward_loss': reward_loss.item(),
         }
 
-    for epoch in range(cfg.epochs):
+    def evaluate(eval_epoch):
+
+        def plot_hists(loader, name):
+            model_loss_total = 0
+            model_loss_shuffle = 0
+            inv_model_loss_total = 0
+            inv_model_loss_shuffle = 0
+            bins = np.linspace(0, 20, 100, endpoint=True)
+            bins = np.concatenate([bins, [10000]])
+            hists = dict()
+            max_batches = 200
+            fig, ax = plt.subplots()
+            with torch.no_grad():
+                for batch_i, batch in enumerate(loader):
+                    z = encoder(batch['observations'])
+                    z_next = encoder(batch['next_observations'])
+                    z_pred = forward_model(z, batch['actions'])
+                    for i in range(z_next.shape[1]):
+                        hists[i] = hists.get(i, np.zeros_like(bins[:-1]))
+                        dist = torch.norm(z[:, 0] - z_next[:, i], dim=-1)
+                        hists[i] += np.histogram(dist.cpu().numpy(), bins=bins)[0]
+                    hists["rand"] = hists.get("rand", np.zeros_like(bins[:-1]))
+                    dist_rand = torch.norm(z[:, 0] - z_next[torch.randperm(len(z)), 0], dim=-1)
+                    hists["rand"] += np.histogram(dist_rand.cpu().numpy(), bins=bins)[0]
+
+                    model_loss_total += model_loss_fn(z_pred, z_next)
+                    model_loss_shuffle += model_loss_fn(z_pred, z_next[torch.randperm(len(z))])
+
+                    action_pred = inv_model(torch.cat([z[:, 0], z_next[:, 2]], dim=-1))
+                    action_pred_rand = inv_model(torch.cat([z[:, 0], z_next[torch.randperm(len(z)), 2]], dim=-1))
+                    inv_model_loss_total += F.mse_loss(action_pred, batch['actions'][:, 0])
+                    inv_model_loss_shuffle += F.mse_loss(action_pred_rand, batch['actions'][:, 0])
+
+                    if batch_i > max_batches:
+                        break
+            print(
+                f"Model loss: {model_loss_total / len(loader)}\n"
+                f"Model loss (shuffle): {model_loss_shuffle / len(loader)}"
+                f"Inv model loss: {inv_model_loss_total / len(loader)}\n"
+                f"Inv model loss (shuffle): {inv_model_loss_shuffle / len(loader)}"
+            )
+
+            plotting_bins = np.copy(bins)
+            plotting_bins[-1] = plotting_bins[-2] + 1
+            for key, val in hists.items():
+                if key in set(range(5, 1000)):
+                    continue
+                val /= np.sum(val)
+                ax.stairs(val, plotting_bins, label=f"Distance {key}")
+            fig.legend()
+            ax.set_ylim(0, 0.2)
+            wandb.log({f"hist_{name}_{epoch}": wandb.Image(fig)})
+
+        plot_hists(val_set_loader, "val")
+        plot_hists(dataloader, "train")
+
+        """
+        Preprocess data for NNDescent
+        """
+        next_state_distance = 2
+        num_obs = sum([len(traj["observations"]) for traj in trajs]) - next_state_distance * len(trajs)
+
+        obs_norm = np.zeros((num_obs, latent_dim), dtype=np.float32)
+        z_next = np.zeros((num_obs, latent_dim), dtype=np.float32)
+
+        returns = np.zeros(num_obs, dtype=np.float32)
+        actions = np.zeros((num_obs, trajs[0]['actions'].shape[1]), dtype=np.float32)
+
+        ind = 0
+        for traj in tqdm(trajs):
+            indices = slice(ind, ind + traj['observations'].shape[0] - next_state_distance)
+            obs = traj['observations']
+            z = encoder(torch.tensor(obs, dtype=torch.float32)).detach().cpu().numpy()
+            obs_norm[indices] = z[:-next_state_distance]
+            z_next[indices] = z[next_state_distance:]
+            returns[indices] = traj['returns'][:-next_state_distance]
+            actions[indices] = traj['actions'][:-next_state_distance]
+            ind += traj['observations'].shape[0] - next_state_distance
+
+        index = NNDescent(obs_norm, metric='euclidean')
+        eval_env = wrap_env(
+            env=gym.make(cfg.env),
+            state_mean=infos['obs_mean'],
+            state_std=infos['obs_std'],
+            reward_scale=1.0,
+        )
+        eval_episodes = 100
+        best_return = -np.inf
+        best_returns = None
+        best_return_inv = -np.inf
+        best_returns_inv = None
+        for k in cfg.k:
+            def eval():
+                obs = eval_env.reset()
+                done = False
+                total_reward = 0.0
+                while not done:
+                    z = encoder(torch.tensor(obs, dtype=torch.float32).unsqueeze(0)).detach().cpu().numpy()
+                    idxs, dists = index.query(z[0], k=k)
+                    neighbor_rets = returns[idxs]
+                    ranks = neighbor_rets * np.exp(-1 * dists)
+                    best_idx = idxs[0, np.argmax(ranks)]
+
+                    action = actions[best_idx]
+                    obs, reward, done, _ = eval_env.step(action)
+                    total_reward += reward
+                return total_reward
+
+            eval_rets = [eval() for _ in trange(eval_episodes, desc="Evaluation", leave=False)]
+            print("Mean return:", np.mean(eval_rets), env.get_normalized_score(np.mean(eval_rets)) * 100.0)
+
+            wandb.log({f"eval/return_{k}": np.mean(eval_rets),
+                       f"eval/normalized_return_{k}": env.get_normalized_score(np.mean(eval_rets)) * 100.0})
+            wandb.log({f"eval/returns_{k}": eval_rets, f"eval/returns_normalized_{k}": [env.get_normalized_score(x) * 100.0 for x in eval_rets]})
+            if np.mean(eval_rets) > best_return:
+                best_return = np.mean(eval_rets)
+                best_returns = eval_rets
+
+            # %%
+            def eval_inv_model():
+                obs = eval_env.reset()
+                done = False
+                total_reward = 0.0
+                while not done:
+                    z = encoder(torch.tensor(obs, dtype=torch.float32).unsqueeze(0)).detach().cpu().numpy()[0]
+                    idxs, dists = index.query(z, k=k)
+                    neighbor_rets = returns[idxs]
+                    ranks = neighbor_rets * np.exp(-1 * dists)
+                    best_idx = idxs[0, np.argmax(ranks)]
+
+                    action = inv_model(torch.tensor(np.concatenate([z, z_next[best_idx][None, :]], axis=-1),
+                                                    dtype=torch.float32).unsqueeze(0)).detach().cpu().numpy()
+                    obs, reward, done, _ = eval_env.step(action.squeeze())
+                    total_reward += reward
+                return total_reward
+
+            eval_rets_inv = [eval_inv_model() for _ in trange(eval_episodes, desc="Evaluation", leave=False)]
+            print("Mean return:", np.mean(eval_rets_inv), env.get_normalized_score(np.mean(eval_rets_inv)) * 100.0)
+
+            wandb.log({f"eval/return_inv_{k}": np.mean(eval_rets_inv),
+                       f"eval/normalized_return_inv_{k}": env.get_normalized_score(np.mean(eval_rets_inv)) * 100.0})
+            wandb.log({f"eval/returns_inv_{k}": eval_rets_inv, f"eval/returns_normalized_inv_{k}": [env.get_normalized_score(x) * 100.0 for x in eval_rets_inv]})
+            if np.mean(eval_rets_inv) > best_return_inv:
+                best_return_inv = np.mean(eval_rets_inv)
+                best_returns_inv = eval_rets_inv
+
+        wandb.log({f"eval/return": best_return, f"eval/return_inv": best_return_inv})
+        wandb.log({f"eval/returns": best_returns, f"eval/returns_inv": best_returns_inv})
+
+    for epoch in range(max(cfg.epochs)):
         print(f"Epoch {epoch}")
         for batch in tqdm(dataloader):
             metrics = train_step(batch)
             wandb.log(metrics)
-
-
-    def plot_hists(loader, name):
-        model_loss_total = 0
-        model_loss_shuffle = 0
-        inv_model_loss_total = 0
-        inv_model_loss_shuffle = 0
-        bins = np.linspace(0, 20, 100, endpoint=True)
-        bins = np.concatenate([bins, [10000]])
-        hists = dict()
-        max_batches = 200
-        fig, ax = plt.subplots()
-        with torch.no_grad():
-            for batch_i, batch in enumerate(loader):
-                z = encoder(batch['observations'])
-                z_next = encoder(batch['next_observations'])
-                z_pred = forward_model(z, batch['actions'])
-                for i in range(z_next.shape[1]):
-                    hists[i] = hists.get(i, np.zeros_like(bins[:-1]))
-                    dist = torch.norm(z[:, 0] - z_next[:, i], dim=-1)
-                    hists[i] += np.histogram(dist.cpu().numpy(), bins=bins)[0]
-                hists["rand"] = hists.get("rand", np.zeros_like(bins[:-1]))
-                dist_rand = torch.norm(z[:, 0] - z_next[torch.randperm(len(z)), 0], dim=-1)
-                hists["rand"] += np.histogram(dist_rand.cpu().numpy(), bins=bins)[0]
-
-
-                model_loss_total += model_loss_fn(z_pred, z_next)
-                model_loss_shuffle += model_loss_fn(z_pred, z_next[torch.randperm(len(z))])
-
-                action_pred = inv_model(torch.cat([z[:, 0], z_next[:, 2]], dim=-1))
-                action_pred_rand = inv_model(torch.cat([z[:, 0], z_next[torch.randperm(len(z)), 2]], dim=-1))
-                inv_model_loss_total += F.mse_loss(action_pred, batch['actions'][:, 0])
-                inv_model_loss_shuffle += F.mse_loss(action_pred_rand, batch['actions'][:, 0])
-
-                if batch_i > max_batches:
-                    break
-        print(
-            f"Model loss: {model_loss_total / len(loader)}\n"
-            f"Model loss (shuffle): {model_loss_shuffle / len(loader)}"
-            f"Inv model loss: {inv_model_loss_total / len(loader)}\n"
-            f"Inv model loss (shuffle): {inv_model_loss_shuffle / len(loader)}"
-        )
-
-        plotting_bins = np.copy(bins)
-        plotting_bins[-1] = plotting_bins[-2] + 1
-        for key, val in hists.items():
-            if key in set(range(5, 1000)):
-                continue
-            val /= np.sum(val)
-            ax.stairs(val, plotting_bins, label=f"Distance {key}")
-        fig.legend()
-        ax.set_ylim(0, 0.2)
-        wandb.log({f"hist_{name}": wandb.Image(fig)})
-
-    plot_hists(val_set_loader, "val")
-    plot_hists(dataloader, "train")
-
-
-    """
-    Preprocess data for NNDescent
-    """
-    next_state_distance = 2
-    num_obs = sum([len(traj["observations"]) for traj in trajs]) - next_state_distance * len(trajs)
-
-    obs_norm = np.zeros((num_obs, latent_dim), dtype=np.float32)
-    z_next = np.zeros((num_obs, latent_dim), dtype=np.float32)
-
-    returns = np.zeros(num_obs, dtype=np.float32)
-    actions = np.zeros((num_obs, trajs[0]['actions'].shape[1]), dtype=np.float32)
-
-    ind = 0
-    for traj in tqdm(trajs):
-        indices = slice(ind, ind+traj['observations'].shape[0] - next_state_distance)
-        obs = traj['observations']
-        z = encoder(torch.tensor(obs, dtype=torch.float32)).detach().cpu().numpy()
-        obs_norm[indices] = z[:-next_state_distance]
-        z_next[indices] = z[next_state_distance:]
-        returns[indices] = traj['returns'][:-next_state_distance]
-        actions[indices] = traj['actions'][:-next_state_distance]
-        ind += traj['observations'].shape[0] - next_state_distance
-
-    index = NNDescent(obs_norm, metric='euclidean')
-    eval_env = wrap_env(
-        env=gym.make(cfg.env),
-        state_mean=infos['obs_mean'],
-        state_std=infos['obs_std'],
-        reward_scale=1.0,
-    )
-    eval_episodes = 100
-    k=500
-
-    def eval():
-        obs = eval_env.reset()
-        done = False
-        total_reward = 0.0
-        while not done:
-            z = encoder(torch.tensor(obs, dtype=torch.float32).unsqueeze(0)).detach().cpu().numpy()
-            idxs, dists = index.query(z[0], k=k)
-            neighbor_rets = returns[idxs]
-            ranks = neighbor_rets * np.exp(-1 * dists)
-            best_idx = idxs[0, np.argmax(ranks)]
-
-            action = actions[best_idx]
-            obs, reward, done, _ = eval_env.step(action)
-            total_reward += reward
-        return total_reward
-
-
-    eval_rets = [eval() for _ in trange(eval_episodes, desc="Evaluation", leave=False)]
-    print("Mean return:", np.mean(eval_rets), env.get_normalized_score(np.mean(eval_rets)) * 100.0)
-
-    wandb.log({"eval/return": np.mean(eval_rets), "eval/normalized_return": env.get_normalized_score(np.mean(eval_rets)) * 100.0})
-    eval_rets = wandb.Table(data=[[x] for x in eval_rets], columns=["eval_return"])
-    wandb.log({"eval/returns": wandb.plot.histogram(eval_rets, "eval_return")})
-
-    #%%
-    def eval_inv_model():
-        obs = eval_env.reset()
-        done = False
-        total_reward = 0.0
-        while not done:
-            z = encoder(torch.tensor(obs, dtype=torch.float32).unsqueeze(0)).detach().cpu().numpy()[0]
-            idxs, dists = index.query(z, k=k)
-            neighbor_rets = returns[idxs]
-            ranks = neighbor_rets * np.exp(-1 * dists)
-            best_idx = idxs[0, np.argmax(ranks)]
-
-            action = inv_model(torch.tensor(np.concatenate([z, z_next[best_idx][None,:]], axis=-1), dtype=torch.float32).unsqueeze(0)).detach().cpu().numpy()
-            obs, reward, done, _ = eval_env.step(action.squeeze())
-            total_reward += reward
-        return total_reward
-
-
-    eval_rets_inv = [eval_inv_model() for _ in trange(eval_episodes, desc="Evaluation", leave=False)]
-    print("Mean return:", np.mean(eval_rets_inv), env.get_normalized_score(np.mean(eval_rets_inv)) * 100.0)
-
-    wandb.log({"eval/return_inv": np.mean(eval_rets_inv), "eval/normalized_return_inv": env.get_normalized_score(np.mean(eval_rets_inv)) * 100.0})
-    eval_rets = wandb.Table(data=[[x] for x in eval_rets_inv], columns=["eval_return_inv"])
-    wandb.log({"eval/returns_inv": wandb.plot.histogram(eval_rets, "eval_return_inv")})
+            if epoch in cfg.epochs:
+                evaluate(epoch)
 
 
 

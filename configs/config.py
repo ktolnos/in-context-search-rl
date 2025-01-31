@@ -11,7 +11,8 @@ class Config:
     env: str
     seed: int
     target_ema: float
-    epochs: int
+    epochs: list[int]
+    k: list[int]
 
     grad_clip_norm: float
 
