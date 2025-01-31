@@ -17,6 +17,5 @@ array=(
 )
 for i in "${array[@]}"
 do
-  echo "${@:2}"
-#	echo python main.py name=$1-$i group=$1 env=$i "${@:2}" &
+	python main.py name=$1-$i group=$1 env=$i "${@:2}" &
 done
