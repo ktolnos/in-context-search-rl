@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from rliable import library as rly, metrics, plot_utils
-from plot_config import datasets_in_use, groups_to_plot
+from plot_config import datasets_in_use, groups_to_plot, k_to_plot, list_of_list
 
 dataframe = pd.read_csv("runs_tables/offline_urls.csv")
 with open("bin/offline_scores.pickle", "rb") as handle:
@@ -15,8 +15,14 @@ with open("bin/offline_scores.pickle", "rb") as handle:
 with open("bin/myscores.pkl", "rb") as handle:
     my_scores = pickle.load(handle)
 
+with open("bin/myscores_100.pkl", "rb") as handle:
+    my_scores_100 = pickle.load(handle)
+
 for algo in my_scores:
     full_scores[algo] = my_scores[algo]
+
+for algo in my_scores_100:
+    full_scores[algo] = my_scores_100[algo]
 
 os.makedirs("./out", exist_ok=True)
 
@@ -155,7 +161,7 @@ algorithms = [
     "SAC-N",
     "EDAC",
     "DT",
-] + groups_to_plot + [gr + "_inv" for gr in groups_to_plot]
+] + [g+k for g in groups_to_plot for k in map(str, k_to_plot)] + [gr + "_inv_" +k for gr in groups_to_plot for k in map(str, k_to_plot)]
 datasets = datasets_in_use #dataframe["dataset"].unique()
 
 
@@ -209,8 +215,11 @@ def get_table(
     row_delim="\\midrule",
     row_end=" \\\\",
     row_begin="",
+    add_header_delim=False,
 ):
     rows = [row_begin + delim.join(["Task Name"] + algorithms) + row_end]
+    if add_header_delim:
+        rows.append(row_begin + "|".join(["---"] * (len(algorithms) + 1)) + row_end)
     prev_env = "halfcheetah"
     for data in ordered_datasets:
         env = data.split("-")[0]
@@ -229,16 +238,18 @@ def get_table(
         rows.append(row_begin + delim.join(row) + row_end)
     return "\n".join(rows)
 
+os.makedirs("out", exist_ok=True)
 
 print(get_table(last_scores, last_stds))
-print()
+print("\n")
 print(get_table(max_scores, max_stds))
-print()
-print(get_table(last_scores, last_stds, "±", "|", "", "|", "|"))
-print()
-print(get_table(max_scores, max_stds, "±", "|", "", "|", "|"))
+print("\n")
 
-os.makedirs("out", exist_ok=True)
+with open("out/tables.md", "w") as f:
+    f.write("# Last Scores\n")
+    f.write(get_table(last_scores, last_stds, "±", "|", "", "|", "|", True))
+    f.write("\n\n\n# Max Scores\n")
+    f.write(get_table(max_scores, max_stds, "±", "|", "", "|", "|", True))
 
 plt.rcParams["figure.figsize"] = (15, 8)
 plt.rcParams["figure.dpi"] = 300

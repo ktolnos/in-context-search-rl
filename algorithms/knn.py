@@ -20,7 +20,7 @@ import torch.nn.functional as F
 import wandb
 from tqdm import tqdm, trange
 import multiprocessing
-from algorithms.data import load_and_preprocess, wrap_env
+from algorithms.data import load_and_preprocess, wrap_env, discounted_cumsum
 from algorithms.nets import Encoder, ForwardModel, InvModel, RewardModel
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
@@ -28,7 +28,10 @@ from algorithms.rollout_dataset import RolloutDataset
 from pynndescent import NNDescent
 import matplotlib.pyplot as plt
 
+
 def run_knn(cfg: Config):
+    global_step = 0
+
     env = gym.make(cfg.env)
     torch.set_default_device('cuda')
 
@@ -115,66 +118,9 @@ def run_knn(cfg: Config):
             'reward_loss': reward_loss.item(),
         }
 
-    def evaluate(eval_epoch):
+    next_state_distance = 2
 
-        def plot_hists(loader, name):
-            model_loss_total = 0
-            model_loss_shuffle = 0
-            inv_model_loss_total = 0
-            inv_model_loss_shuffle = 0
-            bins = np.linspace(0, 20, 100, endpoint=True)
-            bins = np.concatenate([bins, [10000]])
-            hists = dict()
-            max_batches = 200
-            fig, ax = plt.subplots()
-            with torch.no_grad():
-                for batch_i, batch in enumerate(loader):
-                    z = encoder(batch['observations'])
-                    z_next = encoder(batch['next_observations'])
-                    z_pred = forward_model(z, batch['actions'])
-                    for i in range(z_next.shape[1]):
-                        hists[i] = hists.get(i, np.zeros_like(bins[:-1]))
-                        dist = torch.norm(z[:, 0] - z_next[:, i], dim=-1)
-                        hists[i] += np.histogram(dist.cpu().numpy(), bins=bins)[0]
-                    hists["rand"] = hists.get("rand", np.zeros_like(bins[:-1]))
-                    dist_rand = torch.norm(z[:, 0] - z_next[torch.randperm(len(z)), 0], dim=-1)
-                    hists["rand"] += np.histogram(dist_rand.cpu().numpy(), bins=bins)[0]
-
-                    model_loss_total += model_loss_fn(z_pred, z_next)
-                    model_loss_shuffle += model_loss_fn(z_pred, z_next[torch.randperm(len(z))])
-
-                    action_pred = inv_model(torch.cat([z[:, 0], z_next[:, 2]], dim=-1))
-                    action_pred_rand = inv_model(torch.cat([z[:, 0], z_next[torch.randperm(len(z)), 2]], dim=-1))
-                    inv_model_loss_total += F.mse_loss(action_pred, batch['actions'][:, 0])
-                    inv_model_loss_shuffle += F.mse_loss(action_pred_rand, batch['actions'][:, 0])
-
-                    if batch_i > max_batches:
-                        break
-            print(
-                f"Model loss: {model_loss_total / len(loader)}\n"
-                f"Model loss (shuffle): {model_loss_shuffle / len(loader)}"
-                f"Inv model loss: {inv_model_loss_total / len(loader)}\n"
-                f"Inv model loss (shuffle): {inv_model_loss_shuffle / len(loader)}"
-            )
-
-            plotting_bins = np.copy(bins)
-            plotting_bins[-1] = plotting_bins[-2] + 1
-            for key, val in hists.items():
-                if key in set(range(5, 1000)):
-                    continue
-                val /= np.sum(val)
-                ax.stairs(val, plotting_bins, label=f"Distance {key}")
-            fig.legend()
-            ax.set_ylim(0, 0.2)
-            wandb.log({f"hist_{name}_{epoch}": wandb.Image(fig)})
-
-        plot_hists(val_set_loader, "val")
-        plot_hists(dataloader, "train")
-
-        """
-        Preprocess data for NNDescent
-        """
-        next_state_distance = 2
+    def build_index():
         num_obs = sum([len(traj["observations"]) for traj in trajs]) - next_state_distance * len(trajs)
 
         obs_norm = np.zeros((num_obs, latent_dim), dtype=np.float32)
@@ -195,6 +141,93 @@ def run_knn(cfg: Config):
             ind += traj['observations'].shape[0] - next_state_distance
 
         index = NNDescent(obs_norm, metric='euclidean')
+        return index, z_next, returns, actions
+
+
+    for epoch in range(cfg.epochs):
+        print(f"Epoch {epoch}")
+        wandb.log({"epoch": epoch}, step=global_step)
+        for batch in tqdm(dataloader):
+            global_step += len(batch['observations'])
+            metrics = train_step(batch)
+            wandb.log(metrics, step=global_step)
+
+    index, index_z_next, index_returns, index_actions = build_index()
+    finetune_env = wrap_env(
+        env=gym.make(cfg.env),
+        state_mean=infos['obs_mean'],
+        state_std=infos['obs_std'],
+        reward_scale=1.0,
+    )
+    finetune_episodes = max(cfg.eval_episodes)+1
+    finetune_z = []
+    finetune_z_next = []
+    finetune_actions = []
+    finetune_returns = []
+    reward_mean = infos['reward_mean']
+    reward_std = infos['reward_std']
+    k = cfg.k
+    c = 1
+
+    knn_temps = np.array(cfg.knn_temp)
+    temp_counts = np.zeros_like(knn_temps)
+    temp_returns = np.zeros_like(knn_temps)
+
+    def rollout_episode(env, eval=True):
+        if eval:
+            if np.any(temp_counts == 0):
+                temp = 1
+            else:
+                temp = knn_temps[np.argmax(temp_returns / temp_counts)]
+        else:
+            # select knn_temp using UCB
+            if np.any(temp_counts == 0):
+                temp_idx = np.random.choice(len(knn_temps))
+                temp = knn_temps[temp_idx]
+            else:
+                temp_avg = temp_returns / temp_counts
+                temp_rating = temp_avg + c * np.sqrt(2 * np.log(np.sum(temp_counts)) / temp_counts)
+                temp_idx = np.argmax(temp_rating)
+                temp = knn_temps[temp_idx]
+            temp_counts[temp_idx] += 1
+
+        rollout_z = []
+        rollout_actions = []
+        rollout_rewards = []
+
+        obs = env.reset()
+        done = False
+        total_reward = 0.0
+        while not done:
+            z = encoder(torch.tensor(obs, dtype=torch.float32).unsqueeze(0)).detach().cpu().numpy()[0]
+            rollout_z.append(z)
+            idxs, dists = index.query(z, k=k)
+            neighbor_rets = index_returns[idxs]
+            ranks = neighbor_rets * np.exp(-temp * dists)
+            best_rank_idx = np.argmax(ranks)
+            best_idx = idxs[0, best_rank_idx]
+            z_next_best = index_z_next[best_idx][None, :]
+            best_rank = ranks[0, best_rank_idx]
+
+            for i, ret in enumerate(finetune_returns):
+                rank = ret * np.exp(-temp * np.linalg.norm(z - finetune_returns[i]))
+                if rank > best_rank:
+                    best_rank = rank
+                    z_next_best = finetune_z_next[i]
+
+            action = inv_model(torch.tensor(np.concatenate([z, z_next_best], axis=-1),
+                                            dtype=torch.float32).unsqueeze(0)).detach().cpu().numpy()
+            rollout_actions.append(action)
+            obs, reward, done, _ = env.step(action.squeeze())
+            rollout_rewards.append(reward)
+            total_reward += reward
+
+        if not eval:
+            temp_returns[temp_idx] += env.get_normalized_score(total_reward)
+            wandb.log({f"finetune/best_knn_temp": knn_temps[np.argmax(temp_returns / temp_counts)]}, step=global_step)
+        return total_reward, rollout_z, rollout_actions, rollout_rewards
+
+    def evaluate():
         eval_env = wrap_env(
             env=gym.make(cfg.env),
             state_mean=infos['obs_mean'],
@@ -202,75 +235,36 @@ def run_knn(cfg: Config):
             reward_scale=1.0,
         )
         eval_episodes = 100
-        best_return = -np.inf
-        best_returns = None
-        best_return_inv = -np.inf
-        best_returns_inv = None
-        for k in cfg.k:
-            def eval():
-                obs = eval_env.reset()
-                done = False
-                total_reward = 0.0
-                while not done:
-                    z = encoder(torch.tensor(obs, dtype=torch.float32).unsqueeze(0)).detach().cpu().numpy()
-                    idxs, dists = index.query(z[0], k=k)
-                    neighbor_rets = returns[idxs]
-                    ranks = neighbor_rets * np.exp(-1 * dists)
-                    best_idx = idxs[0, np.argmax(ranks)]
 
-                    action = actions[best_idx]
-                    obs, reward, done, _ = eval_env.step(action)
-                    total_reward += reward
-                return total_reward
+        eval_rets_inv = [rollout_episode(eval_env, eval=True)[0] for _ in trange(eval_episodes, desc="Evaluation", leave=False)]
+        print("Mean return:", np.mean(eval_rets_inv), env.get_normalized_score(np.mean(eval_rets_inv)) * 100.0)
 
-            eval_rets = [eval() for _ in trange(eval_episodes, desc="Evaluation", leave=False)]
-            print("Mean return:", np.mean(eval_rets), env.get_normalized_score(np.mean(eval_rets)) * 100.0)
+        wandb.log({f"eval/return": np.mean(eval_rets_inv),
+                   f"eval/normalized_return": env.get_normalized_score(np.mean(eval_rets_inv)) * 100.0},
+                  step=global_step)
+        wandb.log({f"eval/returns": eval_rets_inv,
+                   f"eval/returns_normalized": [env.get_normalized_score(x) * 100.0 for x in eval_rets_inv]},
+                  step=global_step)
 
-            wandb.log({f"eval/return_{k}": np.mean(eval_rets),
-                       f"eval/normalized_return_{k}": env.get_normalized_score(np.mean(eval_rets)) * 100.0})
-            wandb.log({f"eval/returns_{k}": eval_rets, f"eval/returns_normalized_{k}": [env.get_normalized_score(x) * 100.0 for x in eval_rets]})
-            if np.mean(eval_rets) > best_return:
-                best_return = np.mean(eval_rets)
-                best_returns = eval_rets
+    for i in range(finetune_episodes):
+        if i in cfg.eval_episodes:
+            evaluate()
 
-            # %%
-            def eval_inv_model():
-                obs = eval_env.reset()
-                done = False
-                total_reward = 0.0
-                while not done:
-                    z = encoder(torch.tensor(obs, dtype=torch.float32).unsqueeze(0)).detach().cpu().numpy()[0]
-                    idxs, dists = index.query(z, k=k)
-                    neighbor_rets = returns[idxs]
-                    ranks = neighbor_rets * np.exp(-1 * dists)
-                    best_idx = idxs[0, np.argmax(ranks)]
+        fintune_return_new, finetune_z_new, finetune_actions_new, fintune_rewards_new = rollout_episode(finetune_env, eval=False)
+        global_step += len(fintune_rewards_new)
 
-                    action = inv_model(torch.tensor(np.concatenate([z, z_next[best_idx][None, :]], axis=-1),
-                                                    dtype=torch.float32).unsqueeze(0)).detach().cpu().numpy()
-                    obs, reward, done, _ = eval_env.step(action.squeeze())
-                    total_reward += reward
-                return total_reward
+        wandb.log({"finetune/return": fintune_return_new}, step=global_step)
+        wandb.log({"finetune/normalized_return": finetune_env.get_normalized_score(fintune_return_new) * 100.0}, step=global_step)
+        if len(fintune_rewards_new) < next_state_distance:
+            continue
 
-            eval_rets_inv = [eval_inv_model() for _ in trange(eval_episodes, desc="Evaluation", leave=False)]
-            print("Mean return:", np.mean(eval_rets_inv), env.get_normalized_score(np.mean(eval_rets_inv)) * 100.0)
-
-            wandb.log({f"eval/return_inv_{k}": np.mean(eval_rets_inv),
-                       f"eval/normalized_return_inv_{k}": env.get_normalized_score(np.mean(eval_rets_inv)) * 100.0})
-            wandb.log({f"eval/returns_inv_{k}": eval_rets_inv, f"eval/returns_normalized_inv_{k}": [env.get_normalized_score(x) * 100.0 for x in eval_rets_inv]})
-            if np.mean(eval_rets_inv) > best_return_inv:
-                best_return_inv = np.mean(eval_rets_inv)
-                best_returns_inv = eval_rets_inv
-
-        wandb.log({f"eval/return": best_return, f"eval/return_inv": best_return_inv})
-        wandb.log({f"eval/returns": best_returns, f"eval/returns_inv": best_returns_inv})
-
-    for epoch in range(max(cfg.epochs)):
-        print(f"Epoch {epoch}")
-        for batch in tqdm(dataloader):
-            metrics = train_step(batch)
-            wandb.log(metrics)
-            if epoch in cfg.epochs:
-                evaluate(epoch)
+        fintune_rewards_new = np.array(fintune_rewards_new)
+        fintune_rewards_new = (fintune_rewards_new - reward_mean) / reward_std
+        returns = discounted_cumsum(fintune_rewards_new, cfg.gamma)
+        finetune_returns.extend(returns[:-next_state_distance])
+        finetune_z.extend(finetune_z_new[:-next_state_distance])
+        finetune_z_next.extend(finetune_z_new[next_state_distance:])
+        finetune_actions.extend(finetune_actions_new[:-next_state_distance])
 
 
 

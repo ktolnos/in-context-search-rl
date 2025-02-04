@@ -1,5 +1,5 @@
 datasets_in_use = set([
-    "halfcheetah-medium-v2",
+    # "halfcheetah-medium-v2",
     "halfcheetah-medium-replay-v2",
     "halfcheetah-medium-expert-v2",
     "hopper-medium-v2",
@@ -12,8 +12,11 @@ datasets_in_use = set([
     "pen-cloned-v1",
     "pen-expert-v1",
     "door-cloned-v1",
-    "hammer-cloned-v1",
+    # "hammer-cloned-v1",
     "relocate-cloned-v1",
 ])
 
-groups_to_plot = ["5step-2epoch", "5epochs"]
+groups_to_plot = ["sweep"]
+k_to_plot = [1000]
+def list_of_list():
+    return [[]]
